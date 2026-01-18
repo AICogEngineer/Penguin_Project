@@ -1,0 +1,7 @@
+gradio
+langchain
+langchain-aws
+python-dotenv 
+boto3
+langchain-google-genai
+langchain-google-verexai
