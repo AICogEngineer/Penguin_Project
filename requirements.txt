@@ -9,3 +9,9 @@ chromadb
 tiktoken
 python-dotenv
 docling
+gradio
+langchain
+langchain-aws
+python-dotenv 
+boto3
+langchain-google-genai
