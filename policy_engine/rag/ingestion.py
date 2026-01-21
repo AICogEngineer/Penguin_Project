@@ -3,7 +3,7 @@ import os
 import shutil
 import time
 from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import MarkdownHeaderTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
@@ -40,12 +40,20 @@ def ingest_policy():
     loader = DoclingLoader(PDF_PATH)
     docs = list(loader.lazy_load())
     
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        add_start_index=True,
-    )
-    splits = text_splitter.split_documents(docs)
+    headers_to_split_on = [
+        ("#", "Header 1"),
+        ("##", "Header 2"),
+        ("###", "Header 3"),
+    ]
+    
+    markdown_text = docs[0].page_content
+    
+    markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+    splits = markdown_splitter.split_text(markdown_text)
+    
+    # ensure metadata is preserved
+    for split in splits:
+        split.metadata["source"] = PDF_PATH
     print(f"Split policy into {len(splits)} chunks.")
 
     print("Initializing embeddings...")
