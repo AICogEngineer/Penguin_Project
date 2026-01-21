@@ -3,34 +3,27 @@ import os
 import shutil
 import time
 from dotenv import load_dotenv
-from langchain_text_splitters import MarkdownHeaderTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_pinecone import PineconeVectorStore
-from pinecone import Pinecone, ServerlessSpec
+from langchain_chroma import Chroma
 from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
 from docling.document_converter import DocumentConverter
 
 load_dotenv()
 
+#Use Markdown header text splitting to get more proper precise data and chunks
+
 PDF_PATH = os.getenv("POLICY_PDF_PATH")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
+pipeline_options = PdfPipelineOptions()
+pipeline_options.allow_external_plugins = True
+
 
 if not PDF_PATH or not PINECONE_API_KEY or not PINECONE_INDEX_NAME or not EMBEDDING_MODEL:
     raise ValueError("POLICY_PDF_PATH, PINECONE_API_KEY, PINECONE_INDEX_NAME, and EMBEDDING_MODEL must be set in the environment.")
-
-class DoclingLoader(BaseLoader):
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        self.converter = DocumentConverter()
-
-    def lazy_load(self):
-        print(f"Converting {self.file_path} with Docling...")
-        result = self.converter.convert(self.file_path)
-        md_content = result.document.export_to_markdown()
-        yield Document(page_content=md_content, metadata={"source": self.file_path})
 
 def ingest_policy():
     print(f"Loading policy from {PDF_PATH}...")
@@ -40,20 +33,12 @@ def ingest_policy():
     loader = DoclingLoader(PDF_PATH)
     docs = list(loader.lazy_load())
     
-    headers_to_split_on = [
-        ("#", "Header 1"),
-        ("##", "Header 2"),
-        ("###", "Header 3"),
-    ]
-    
-    markdown_text = docs[0].page_content
-    
-    markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
-    splits = markdown_splitter.split_text(markdown_text)
-    
-    # ensure metadata is preserved
-    for split in splits:
-        split.metadata["source"] = PDF_PATH
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        add_start_index=True,
+    )
+    splits = text_splitter.split_documents(docs)
     print(f"Split policy into {len(splits)} chunks.")
 
     print("Initializing embeddings...")
