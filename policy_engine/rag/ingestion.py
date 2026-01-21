@@ -1,10 +1,12 @@
 
 import os
 import shutil
+import time
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone, ServerlessSpec
 from langchain_core.document_loaders import BaseLoader
 from langchain_core.documents import Document
 from docling.document_converter import DocumentConverter
@@ -12,11 +14,12 @@ from docling.document_converter import DocumentConverter
 load_dotenv()
 
 PDF_PATH = os.getenv("POLICY_PDF_PATH")
-DB_PATH = os.getenv("CHROMA_DB_PATH")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
 
-if not PDF_PATH or not DB_PATH or not EMBEDDING_MODEL:
-    raise ValueError("POLICY_PDF_PATH, CHROMA_DB_PATH, and EMBEDDING_MODEL must be set in the environment.")
+if not PDF_PATH or not PINECONE_API_KEY or not PINECONE_INDEX_NAME or not EMBEDDING_MODEL:
+    raise ValueError("POLICY_PDF_PATH, PINECONE_API_KEY, PINECONE_INDEX_NAME, and EMBEDDING_MODEL must be set in the environment.")
 
 class DoclingLoader(BaseLoader):
     def __init__(self, file_path: str):
@@ -48,11 +51,30 @@ def ingest_policy():
     print("Initializing embeddings...")
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
-    print(f"Creating/Updating Vector Store at {DB_PATH}...")
-    vectorstore = Chroma.from_documents(
+    print(f"Initializing Pinecone index: {PINECONE_INDEX_NAME}...")
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    
+    existing_indexes = [index_info["name"] for index_info in pc.list_indexes()]
+
+    if PINECONE_INDEX_NAME not in existing_indexes:
+        print(f"Creating index {PINECONE_INDEX_NAME}...")
+        pc.create_index(
+            name=PINECONE_INDEX_NAME,
+            dimension=384, # all-MiniLM-L6-v2 dimension
+            metric="cosine",
+            spec=ServerlessSpec(
+                cloud="aws",
+                region="us-east-1"
+            )
+        )
+        while not pc.describe_index(PINECONE_INDEX_NAME).status['ready']:
+            time.sleep(1)
+
+    print(f"Upserting to Pinecone index {PINECONE_INDEX_NAME}...")
+    vectorstore = PineconeVectorStore.from_documents(
         documents=splits,
         embedding=embeddings,
-        persist_directory=DB_PATH
+        index_name=PINECONE_INDEX_NAME
     )
     print("Ingestion complete!")
 

@@ -1,15 +1,16 @@
+
 import os
 from dotenv import load_dotenv
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+from langchain_pinecone import PineconeVectorStore
 
 load_dotenv()
 
-DB_PATH = os.getenv("CHROMA_DB_PATH")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
 
-if not DB_PATH or not EMBEDDING_MODEL:
-    raise ValueError("CHROMA_DB_PATH and EMBEDDING_MODEL must be set in the environment.")
+if not PINECONE_INDEX_NAME or not EMBEDDING_MODEL:
+    raise ValueError("PINECONE_INDEX_NAME and EMBEDDING_MODEL must be set in the environment.")
 
 # Global cache for the embedding model to prevent re-loading weights on every call
 _cached_embeddings = None
@@ -32,9 +33,9 @@ def get_policy_retriever(k=4):
     """
     embeddings = get_embeddings()
     
-    vectorstore = Chroma(
-        persist_directory=DB_PATH,
-        embedding_function=embeddings
+    vectorstore = PineconeVectorStore.from_existing_index(
+        index_name=PINECONE_INDEX_NAME,
+        embedding=embeddings
     )
     
     return vectorstore.as_retriever(search_kwargs={"k": k})
