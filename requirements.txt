@@ -4,7 +4,6 @@ langchain-ollama
 langchain-chroma
 pypdf
 sentence-transformers
-chromadb
 tiktoken
 dotenv
 docling
