@@ -13,6 +13,7 @@ import os
 import uuid
 import getpass
 from dotenv import load_dotenv
+import snowflake.connector
 
 SYSTEM_PROMPT = """ You are a customer support agent for the company, PenguinZ.
 
@@ -25,8 +26,31 @@ Put the punctuation mark after the -penguin.
 """
 
 
-@tool
-def get
+load_dotenv()
+
+USER = os.getenv('SNOWFLAKE_USER')
+PASSWORD = os.getenv('SNOWFLAKE_PASSWORD')
+ACCOUNT = os.getenv('SNOWFLAKE_ACCOUNT')
+WAREHOUSE = os.getenv('SNOWFLAKE_WAREHOUSE')
+DATABASE = os.getenv('SNOWFLAKE_DATABASE')
+SCHEMA = os.getenv('SNOWFLAKE_SCHEMA')
+
+conn = snowflake.connector.connect(
+    user=USER,
+    password=PASSWORD,
+    account=ACCOUNT,
+    warehouse=WAREHOUSE,
+    database=DATABASE,
+    schema=SCHEMA
+    )
+
+cur = conn.cursor()
+try:
+    cur.execute('select * from FCT_TRANSACTIONS')
+    ret = cur.fetchmany(3)
+    print(ret)
+finally:
+    cur.close()
 
 
 

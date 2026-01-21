@@ -208,3 +208,4 @@ __marimo__/
 
 .venv/
 /chromadb
+.DS_STORE
