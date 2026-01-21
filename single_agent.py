@@ -17,12 +17,13 @@ You have the ability to answer questions about company policy regarding refunds,
 However, your tools are still under development, so if the user or customer asks about anything regarding that,
 please tell them that it is still under development.
 
-End all your sentences with -penguin.
+End all your sentences with -penguin, connecting -penguin to the last word with no spaces inbetween such as "Hello there-penguin!" or "How may I help you today-penguin?" or "I'm sorry I can't do that-penguin.". 
+Put the punctuation mark after the -penguin.
 """
 
 
 model = ChatOllama(
-    model = "gemma3:12b",
+    model = "gpt-oss",
     validate_model_on_init=True,
     temperature=0.7
 )
