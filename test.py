@@ -27,119 +27,152 @@ llm = ChatBedrockConverse(
     region_name=os.getenv("BEDROCK_AWS_REGION", "us-east-1")
 )
 
-# Schema for structured output to use in planning
-class Section(BaseModel):
-    name: str = Field(
-        description="Name for this section of the report.",
-    )
-    description: str = Field(
-        description="Brief overview of the main topics and concepts to be covered in this section.",
-    )
+from typing_extensions import TypedDict
+from langgraph.graph.state import StateGraph, START
 
 
-class Sections(BaseModel):
-    sections: List[Section] = Field(
-        description="Sections of the report.",
-    )
+# Define subgraph
+class SubgraphState(TypedDict):
+    # note that none of these keys are shared with the parent graph state
+    bar: str
+    baz: str
+
+def subgraph_node_1(state: SubgraphState):
+    return {"baz": "baz"}
+
+def subgraph_node_2(state: SubgraphState):
+    return {"bar": state["bar"] + state["baz"]}
+
+subgraph_builder = StateGraph(SubgraphState)
+subgraph_builder.add_node(subgraph_node_1)
+subgraph_builder.add_node(subgraph_node_2)
+subgraph_builder.add_edge(START, "subgraph_node_1")
+subgraph_builder.add_edge("subgraph_node_1", "subgraph_node_2")
+subgraph = subgraph_builder.compile()
+
+# Define parent graph
+class ParentState(TypedDict):
+    foo: str
+
+def node_1(state: ParentState):
+    return {"foo": "hi! " + state["foo"]}
+
+def node_2(state: ParentState):
+    # Transform the state to the subgraph state
+    response = subgraph.invoke({"bar": state["foo"]})
+    # Transform response back to the parent state
+    return {"foo": response["bar"]}
 
 
-# Augment the LLM with schema for structured output
-planner = llm.with_structured_output(Sections)
+builder = StateGraph(ParentState)
+builder.add_node("node_1", node_1)
+builder.add_node("node_2", node_2)
+builder.add_edge(START, "node_1")
+builder.add_edge("node_1", "node_2")
+graph = builder.compile()
 
-from langgraph.types import Send
-
-
-# Graph state
-class State(TypedDict):
-    topic: str  # Report topic
-    sections: list[Section]  # List of report sections
-    completed_sections: Annotated[
-        list, operator.add
-    ]  # All workers write to this key in parallel
-    final_report: str  # Final report
+for chunk in graph.stream({"foo": "foo"}, subgraphs=True):
+    print(chunk)
 
 
-# Worker state
-class WorkerState(TypedDict):
-    section: Section
-    completed_sections: Annotated[list, operator.add]
+# from typing_extensions import Literal
+# from langchain.messages import HumanMessage, SystemMessage
 
 
-# Nodes
-def orchestrator(state: State):
-    """Orchestrator that generates a plan for the report"""
-
-    # Generate queries
-    report_sections = planner.invoke(
-        [
-            SystemMessage(content="Generate a plan for the report."),
-            HumanMessage(content=f"Here is the report topic: {state['topic']}"),
-        ]
-    )
-
-    return {"sections": report_sections.sections}
+# # Schema for structured output to use as routing logic
+# class Route(BaseModel):
+#     step: Literal["poem", "story", "joke"] = Field(
+#         None, description="The next step in the routing process"
+#     )
 
 
-def llm_call(state: WorkerState):
-    """Worker writes a section of the report"""
-
-    # Generate section
-    section = llm.invoke(
-        [
-            SystemMessage(
-                content="Write a report section following the provided name and description. Include no preamble for each section. Use markdown formatting."
-            ),
-            HumanMessage(
-                content=f"Here is the section name: {state['section'].name} and description: {state['section'].description}"
-            ),
-        ]
-    )
-
-    # Write the updated section to completed sections
-    return {"completed_sections": [section.content]}
+# # Augment the LLM with schema for structured output
+# router = llm.with_structured_output(Route)
 
 
-def synthesizer(state: State):
-    """Synthesize full report from sections"""
-
-    # List of completed sections
-    completed_sections = state["completed_sections"]
-
-    # Format completed section to str to use as context for final sections
-    completed_report_sections = "\n\n---\n\n".join(completed_sections)
-
-    return {"final_report": completed_report_sections}
+# # State
+# class State(TypedDict):
+#     input: str
+#     decision: str
+#     output: str
 
 
-# Conditional edge function to create llm_call workers that each write a section of the report
-def assign_workers(state: State):
-    """Assign a worker to each section in the plan"""
+# # Nodes
+# def llm_call_1(state: State):
+#     """Write a story"""
 
-    # Kick off section writing in parallel via Send() API
-    return [Send("llm_call", {"section": s}) for s in state["sections"]]
+#     result = llm.invoke(state["input"])
+#     return {"output": result.content}
 
 
-# Build workflow
-orchestrator_worker_builder = StateGraph(State)
+# def llm_call_2(state: State):
+#     """Write a joke"""
 
-# Add the nodes
-orchestrator_worker_builder.add_node("orchestrator", orchestrator)
-orchestrator_worker_builder.add_node("llm_call", llm_call)
-orchestrator_worker_builder.add_node("synthesizer", synthesizer)
+#     result = llm.invoke(state["input"])
+#     return {"output": result.content}
 
-# Add edges to connect nodes
-orchestrator_worker_builder.add_edge(START, "orchestrator")
-orchestrator_worker_builder.add_conditional_edges(
-    "orchestrator", assign_workers, ["llm_call"]
-)
-orchestrator_worker_builder.add_edge("llm_call", "synthesizer")
-orchestrator_worker_builder.add_edge("synthesizer", END)
 
-# Compile the workflow
-orchestrator_worker = orchestrator_worker_builder.compile()
+# def llm_call_3(state: State):
+#     """Write a poem"""
 
-# Invoke
-state = orchestrator_worker.invoke({"topic": "Create a report on LLM scaling laws"})
+#     result = llm.invoke(state["input"])
+#     return {"output": result.content}
 
-from IPython.display import Markdown
-Markdown(state["final_report"])
+
+# def llm_call_router(state: State):
+#     """Route the input to the appropriate node"""
+
+#     # Run the augmented LLM with structured output to serve as routing logic
+#     decision = router.invoke(
+#         [
+#             SystemMessage(
+#                 content="Route the input to story, joke, or poem based on the user's request."
+#             ),
+#             HumanMessage(content=state["input"]),
+#         ]
+#     )
+
+#     return {"decision": decision.step}
+
+
+# # Conditional edge function to route to the appropriate node
+# def route_decision(state: State):
+#     # Return the node name you want to visit next
+#     if state["decision"] == "story":
+#         return "llm_call_1"
+#     elif state["decision"] == "joke":
+#         return "llm_call_2"
+#     elif state["decision"] == "poem":
+#         return "llm_call_3"
+
+
+# # Build workflow
+# router_builder = StateGraph(State)
+
+# # Add nodes
+# router_builder.add_node("llm_call_1", llm_call_1)
+# router_builder.add_node("llm_call_2", llm_call_2)
+# router_builder.add_node("llm_call_3", llm_call_3)
+# router_builder.add_node("llm_call_router", llm_call_router)
+
+# # Add edges to connect nodes
+# router_builder.add_edge(START, "llm_call_router")
+# router_builder.add_conditional_edges(
+#     "llm_call_router",
+#     route_decision,
+#     {  # Name returned by route_decision : Name of next node to visit
+#         "llm_call_1": "llm_call_1",
+#         "llm_call_2": "llm_call_2",
+#         "llm_call_3": "llm_call_3",
+#     },
+# )
+# router_builder.add_edge("llm_call_1", END)
+# router_builder.add_edge("llm_call_2", END)
+# router_builder.add_edge("llm_call_3", END)
+
+# # Compile workflow
+# router_workflow = router_builder.compile()
+
+# # Invoke
+# #state = router_workflow.invoke({"input": "Write me a joke about cats"})
+# #print(state["output"])
