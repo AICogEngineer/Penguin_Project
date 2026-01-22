@@ -116,7 +116,6 @@ def human_review(state: AgentState) -> Command[Literal["process_approval"]]:
     }
     
     # --- INTERRUPT ---
-    # The value passed to resume=... in admin_approve will be returned here
     approval_decision = interrupt({
         "message": "Waiting for admin approval",
         "credentials": credentials,
@@ -184,20 +183,16 @@ def user_predict(message, history):
     
     # --- STATUS CHECK LOGIC ---
     if message.lower().strip() in ["check", "status", "update", "done?"]:
-        # 1. Check if we are still waiting at human_review
         if state.next and "human_review" in state.next:
             bot_response = "⏳ **Still Waiting...** \n\nThe admin has not approved the request yet. Please wait a moment and type 'check' again."
             history.append({"role": "user", "content": censored_user_message})
             history.append({"role": "assistant", "content": bot_response})
             return history, ""
         
-        # 2. If NOT waiting, the graph might be finished. Check the history.
-        # When admin resumes, the graph runs to END. So state.next will be empty.
+        # Check if completed
         messages = state.values.get("messages", [])
         if messages:
             last_msg = messages[-1]
-            # Check if this is the "final" message (Access Granted or Denied)
-            # We want to display it if the user hasn't seen it yet.
             if isinstance(last_msg, AIMessage):
                 clean_content = re.sub(r'<thinking>.*?</thinking>', '', last_msg.content, flags=re.DOTALL).strip()
                 bot_response = censor_sensitive_data(clean_content)
@@ -229,8 +224,7 @@ def user_predict(message, history):
         if updated_state.next and "human_review" in updated_state.next:
             bot_response = (f"✋ **Approval Needed**\n\n"
                            f"Your credentials have been submitted for review.\n"
-                           f"**Request ID:** `{thread_id}`\n\n"
-                           f"_Please ask the admin to approve this ID, then type **'check'** here._")
+                           f"Our admin will review your request, You can check your progress by typing **'check'**")
         
         elif result and "messages" in result:
             last_msg = result["messages"][-1]
@@ -245,13 +239,22 @@ def user_predict(message, history):
     history.append({"role": "assistant", "content": bot_response})
     return history, ""
 
-# --- 6. ADMIN LOGIC (FIXED) ---
+# --- 6. ADMIN LOGIC (WITH DROPDOWN) ---
 
-def get_pending_requests():
-    if not PENDING_APPROVALS: return "No pending requests."
+def refresh_admin_view():
+    """Returns updated text for the dashboard AND updated choices for the dropdown."""
+    if not PENDING_APPROVALS:
+        # Return status text and an empty list of choices
+        return "No pending requests.", gr.update(choices=[], value=None)
+    
+    # Build text display
     display_text = ""
+    # Build dropdown choices list (Thread IDs)
+    thread_choices = []
+    
     for tid, data in PENDING_APPROVALS.items():
         creds = data['credentials']
+        thread_choices.append(tid)
         display_text += (
             f"🔹 **Thread ID:** `{tid}`\n"
             f"   **Username:** {creds.get('username', 'N/A')}\n"
@@ -259,26 +262,24 @@ def get_pending_requests():
             f"   **Zip Code:** {creds.get('zip_code', 'N/A')}\n"
             f"   **Status:** {data['status']}\n\n"
         )
-    return display_text
+    
+    # Update dropdown with new choices and auto-select the first one
+    return display_text, gr.update(choices=thread_choices, value=thread_choices[0] if thread_choices else None)
 
-def admin_approve(thread_id_input, decision):
-    target_tid = thread_id_input.strip()
-    if target_tid not in PENDING_APPROVALS: return "❌ Error: ID not found."
+def admin_approve(target_tid, decision):
+    if not target_tid or target_tid not in PENDING_APPROVALS:
+        return f"❌ Error: ID '{target_tid}' not found or invalid."
     
     config = {"configurable": {"thread_id": target_tid}}
-    
-    # Determine value to pass back to interrupt()
     approval_status = "approved" if decision == "Approve" else "rejected"
     
     try:
-        # CRITICAL FIX: Use Command(resume=...) to satisfy the interrupt!
+        # Resume graph
         resume_command = Command(resume=approval_status)
-        
-        # This will un-pause 'human_review', pass 'approval_status' to the variable,
-        # and execute the rest of the graph to completion (END).
         graph.invoke(resume_command, config=config)
         
         del PENDING_APPROVALS[target_tid]
+        
         return f"✅ Request {decision}d for Thread {target_tid}.\nThe user can now type 'check' to see the result."
     except Exception as e:
         return f"❌ Error processing decision: {str(e)}"
@@ -315,12 +316,17 @@ with gr.Blocks(title="AI Agent System") as demo:
                 queue_display = gr.Markdown("No pending requests.")
             gr.Markdown("---")
             with gr.Row():
-                tid_input = gr.Textbox(label="Paste Thread ID here")
+                # NEW: Dropdown instead of Textbox
+                tid_dropdown = gr.Dropdown(label="Select Thread ID", choices=[], interactive=True)
                 decision_radio = gr.Radio(["Approve", "Reject"], label="Action", value="Approve")
                 process_btn = gr.Button("Submit Decision", variant="primary")
             admin_output = gr.Markdown()
 
-            refresh_btn.click(get_pending_requests, outputs=queue_display)
-            process_btn.click(admin_approve, inputs=[tid_input, decision_radio], outputs=admin_output)
+            # Wiring Admin Events
+            # Clicking Refresh updates BOTH the text display AND the dropdown choices
+            refresh_btn.click(refresh_admin_view, outputs=[queue_display, tid_dropdown])
+            
+            # Clicking Process uses the selected value from the dropdown
+            process_btn.click(admin_approve, inputs=[tid_dropdown, decision_radio], outputs=admin_output)
 
 demo.launch()
