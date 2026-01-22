@@ -154,11 +154,11 @@ def build_policy_checker_graph():
     
     return workflow.compile()
 
-if __name__ == "__main__":
-    graph = build_policy_checker_graph()
-    test_input = {"query": "what is the refund policy also what is the ai policy and tell me about the latte method", "order_details": {}}
-    result = graph.invoke(test_input)
-    print("\nFINAL RESULT:")
-    for ans in result.get('answers', []):
-        print(ans)
-        print("-" * 20)
+
+graph = build_policy_checker_graph()
+test_input = {"query": "what is the refund policy also what is the ai policy and tell me about the latte method", "order_details": {}}
+result = graph.invoke(test_input)
+print("\nFINAL RESULT:")
+for ans in result.get('answers', []):
+    print(ans)
+    print("-" * 20)

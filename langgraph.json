@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./policy_engine/agents/policy_checker.py:graph"
+  },
+  "env": ".env"
+}
