@@ -121,7 +121,7 @@ def llm_call_router(state: ParentRouterState):
 # Condition edge for router
 def route_decision(state: ParentRouterState):
 
-    if "lockedState" in state and state["lockedState"] in ["yes", "input"]:
+    if "lockedState" in state and state["lockedState"] in ["pending", "input"]:
         return "userInfoInquiry" 
 
     if state["decision"] == "userInfoInquiry":
@@ -167,12 +167,21 @@ def userInfoInquiry(state: ParentRouterState):
         "credentials": state["credentials"]
     })
 
+    if "lockedState" in state and state["lockedState"] == "verified":
+        return {
+        "messages": response["messages"][-1],
+        "credentials": response["credentials"],
+        "lockedState": state["lockedState"]
+    }
+
     lockedState = "no"
 
     if response["dialogue_state"] in ["awaiting_username", "awaiting_email", "awaiting_zipcode"]:
         lockedState = "input"
-    elif response["approval_status"] in ["pending", "approved"]:
-        lockedState = "yes"
+    elif response["approval_status"] in ["pending"]:
+        lockedState = "pending"
+    elif response["approval_status"] in ["approved"]:
+        lockedState = "approved"
 
     return {
         "messages": response["messages"][-1],
@@ -255,17 +264,6 @@ def predict(message, history):
                 history.append({"role": "assistant", "content": bot_response})
                 return history, ""
             
-            # Check if completed
-            messages = substate.values.get("messages", [])
-            if messages:
-                last_msg = messages[-1]
-                if isinstance(last_msg, AIMessage):
-                    clean_content = re.sub(r'<thinking>.*?</thinking>', '', last_msg.content, flags=re.DOTALL).strip()
-                    bot_response = censor_sensitive_data(clean_content)
-                    history.append({"role": "user", "content": censored_user_message})
-                    history.append({"role": "assistant", "content": bot_response})
-                    return history, ""
-            
             bot_response = "No updates yet."
             history.append({"role": "user", "content": censored_user_message})
             history.append({"role": "assistant", "content": bot_response})
@@ -278,6 +276,19 @@ def predict(message, history):
             history.append({"role": "assistant", "content": bot_response})
             return history, ""
     
+    # Check if completed
+    if "lockedState" in state.values and state.values["lockedState"] == "approved":
+        messages = state.values.get("messages", [])
+        if messages:
+            last_msg = messages[-1]
+            if isinstance(last_msg, AIMessage):
+                clean_content = re.sub(r'<thinking>.*?</thinking>', '', last_msg.content, flags=re.DOTALL).strip()
+                bot_response = censor_sensitive_data(clean_content)
+                history.append({"role": "user", "content": censored_user_message})
+                history.append({"role": "assistant", "content": bot_response})
+                router_graph.update_state(config, {"lockedState": "verified"})
+                return history, ""
+
     input_data = {"messages": [HumanMessage(content=message)], "thread_id": thread_id}
 
     result = router_graph.invoke(input_data, config=config)

@@ -383,7 +383,7 @@ def format_response(state: VerifyUserInfoState) -> Command[Literal[END]]:
     response = AIMessage(content=response_content)
     
     return Command(
-        update={"messages": state["messages"] + [response], "approval_status": "none"},
+        update={"messages": state["messages"] + [response]},
         goto=END
     )
 
