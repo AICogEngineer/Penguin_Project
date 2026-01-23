@@ -713,8 +713,10 @@ def process_refund_approval(state: VerifyUserInfoState) -> Command[Literal[END]]
     
     if approval_status == "approved":
         # Process the refund (Mocking the action)
-        response = AIMessage(content=f"✅ **Refund Approved!**\n\nThe refund for **{product_name}** has been processed successfully despite the warnings. The funds should appear in your account within 3-5 business days.")
+        response = AIMessage(content=f"**Refund Approved!**\n\nThe refund for **{product_name}** has been processed successfully despite the warnings. The funds should appear in your account within 3-5 business days.")
+        status_update = "approved"
     else:
-        response = AIMessage(content=f"❌ **Refund Rejected**\n\nAfter manual review, we cannot process the refund for **{product_name}** at this time due to policy restrictions.")
+        response = AIMessage(content=f"**Refund Rejected**\n\nAfter manual review, we cannot process the refund for **{product_name}** at this time due to policy restrictions.")
+        status_update = "rejected"
         
-    return Command(update={"messages": state["messages"] + [response], "approval_status": "none"}, goto=END)
+    return Command(update={"messages": state["messages"] + [response], "approval_status": status_update}, goto=END)

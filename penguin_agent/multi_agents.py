@@ -12,6 +12,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphInterrupt
 
 from utils.states import VerifyUserInfoState, PolicyQuestionsState, ParentRouterState, Route
 from utils.nodes.policyQuestion_nodes import split_query, process_question, continue_to_verification
@@ -172,33 +173,61 @@ def userInfoInquiry(state: ParentRouterState):
     if "credentials" not in state:
         state["credentials"] = {}
 
-    response = user_subgraph.invoke({
-        "messages": state["messages"][-1].content,
-        "thread_id": state["thread_id"],
-        "credentials": state["credentials"]
-    })
-
-    if "lockedState" in state and state["lockedState"] == "verified":
+    try:
+        response = user_subgraph.invoke({
+            "messages": state["messages"][-1].content,
+            "thread_id": state["thread_id"],
+            "credentials": state["credentials"]
+        })
+        
+        # Normal execution path
+        if state["thread_id"] in PENDING_APPROVALS:
+             # Even if finished, check if we are pending in PENDING_APPROVALS (e.g. just added)
+             lockedState = "pending"
+             # Use the last message from the response if available
+             returned_message = response["messages"][-1]
+             
+        else:
+            if response["dialogue_state"] in ["awaiting_username", "awaiting_email", "awaiting_zipcode", "awaiting_product_selection"]:
+                lockedState = "input"
+            elif response["approval_status"] in ["pending"]:
+                lockedState = "pending"
+            elif response["approval_status"] in ["approved"]:
+                lockedState = "approved"
+            elif response["approval_status"] in ["rejected"]:
+                lockedState = "rejected"
+            else:
+                lockedState = "no"
+                
+            returned_message = response["messages"][-1]
+            
         return {
-        "messages": response["messages"][-1],
-        "credentials": response["credentials"],
-        "lockedState": state["lockedState"]
-    }
+            "messages": returned_message,
+            "credentials": response["credentials"],
+            "lockedState": lockedState
+        }
 
-    lockedState = "no"
-
-    if response["dialogue_state"] in ["awaiting_username", "awaiting_email", "awaiting_zipcode", "awaiting_product_selection"]:
-        lockedState = "input"
-    elif response["approval_status"] in ["pending"]:
-        lockedState = "pending"
-    elif response["approval_status"] in ["approved"]:
-        lockedState = "approved"
-
-    return {
-        "messages": response["messages"][-1],
-        "credentials": response["credentials"],
-        "lockedState": lockedState
-    }
+    except GraphInterrupt:
+        # Graph was interrupted (e.g. human_review_refund)
+        # Verify if we are truly pending
+        if state["thread_id"] in PENDING_APPROVALS:
+             lockedState = "pending"
+             
+             # Fallback message since we can't easily fetch the snapshot without erroring
+             fallback_msg = AIMessage(content="**Refund Approval Needed**\n\nYour request has been flagged for manual review. Please type 'check' shortly to see the status.")
+             
+             return {
+                "messages": fallback_msg,
+                "credentials": state["credentials"], 
+                "lockedState": lockedState
+             }
+        else:
+             # Interrupt but not in pending list
+             return {
+                "messages": AIMessage(content="Processing..."),
+                "credentials": state["credentials"],
+                "lockedState": "pending"
+             }
 
 policy_subgraph = build_policy_checker_graph()
 
@@ -264,8 +293,18 @@ def predict(message, history):
     state = router_graph.get_state(config)
     bot_response = ""
 
-    if router_graph.get_state(config, subgraphs=True).tasks:
-        substate = router_graph.get_state(config, subgraphs=True).tasks[0].state
+    state_snapshot = router_graph.get_state(config, subgraphs=True)
+    print(f"DEBUG: PREDICT START - Message: {message}")
+    print(f"DEBUG: Thread ID: {thread_id}")
+    if state_snapshot.tasks:
+        print(f"DEBUG: Tasks[0] State: {state_snapshot.tasks[0].state}")
+        print(f"DEBUG: Next Step: {state_snapshot.tasks[0].state.next}")
+        
+    state_parent = router_graph.get_state(config)
+    print(f"DEBUG: Parent LockedState: {state_parent.values.get('lockedState')}")
+
+    if state_snapshot.tasks:
+        substate = state_snapshot.tasks[0].state
 
         # --- STATUS CHECK LOGIC ---
         if message.lower().strip() in ["check", "status", "update", "done?"]:
@@ -288,7 +327,8 @@ def predict(message, history):
             return history, ""
     
     # Check if completed
-    if "lockedState" in state.values and state.values["lockedState"] == "approved":
+    # Check if completed
+    if "lockedState" in state.values and state.values["lockedState"] in ["approved", "rejected"]:
         messages = state.values.get("messages", [])
         if messages:
             last_msg = messages[-1]
