@@ -1,8 +1,11 @@
 from utils.states import VerifyUserInfoState
 from langgraph.types import Command, interrupt
+import datetime
 from typing import Literal
+from utils.tools import generate_response, retrieve_docs
 from langchain.messages import AIMessage, SystemMessage
 from langchain_aws import ChatBedrockConverse
+from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END
 from dotenv import load_dotenv
 import snowflake.connector
@@ -49,34 +52,28 @@ def query_snowflake(credentials: dict, query_type: str):
         )
         cursor = conn.cursor()
         
-        # # Execute appropriate query based on type
-        # if query_type == "both":
-        #     # Query DIM_CUSTOMERS using EMAIL
-        #     query = """
-        #         SELECT 
-        #             *
-        #         FROM DIM_CUSTOMERS
-        #         WHERE EMAIL = %s
-        #     """
-        #     cursor.execute(query, (credentials['email'],))
-
         if query_type == "pii":
             # Query DIM_CUSTOMERS using EMAIL
             query = """
-                SELECT 
-                    *
-                FROM DIM_CUSTOMERS
-                WHERE EMAIL = %s
+                SELECT DISTINCT
+                    EMAIL, FIRST_NAME, LAST_NAME, ACCOUNT_TYPE, LOYALTY_POINTS
+                FROM DIM_CUSTOMERS, FCT_TRANSACTIONS
+                WHERE DIM_CUSTOMERS.USER_ID = FCT_TRANSACTIONS.USER_ID
+                AND EMAIL = %s AND BILLING_ZIP_CODE = %s;
             """
-            cursor.execute(query, (credentials['email'],))
+            cursor.execute(query, (credentials['email'], credentials["zip_code"]))
             
         elif query_type == "transactions":
             
             user_query = """
-                SELECT * FROM FCT_TRANSACTIONS
-                WHERE BILLING_ZIP_CODE = %s
+                SELECT 
+                CREATED_DATE, TRANSACTION_TYPE, PRODUCT_NAME, QUANTITY, BRAND, MANUFACTURER, COST_PRICE, UNIT_PRICE, TAX, SUBTOTAL, TOTAL, TRANSACTION_ID
+                FROM FCT_TRANSACTIONS, DIM_CUSTOMERS, DIM_PRODUCTS
+                WHERE DIM_CUSTOMERS.USER_ID = FCT_TRANSACTIONS.USER_ID AND DIM_PRODUCTS.PRODUCT_ID = FCT_TRANSACTIONS.PRODUCT_ID
+                AND EMAIL = %s AND BILLING_ZIP_CODE = %s
+                ORDER BY CREATED_DATE DESC;
             """
-            cursor.execute(user_query, (credentials['zip_code'],))
+            cursor.execute(user_query, (credentials['email'], credentials["zip_code"]))
             user_result = cursor.fetchone()
             
             if not user_result:
@@ -85,7 +82,6 @@ def query_snowflake(credentials: dict, query_type: str):
                 return {"success": True, "data": []}  # No user found
             
             user_id = user_result[0]
-            
         
         else:
             cursor.close()
@@ -118,17 +114,21 @@ def query_snowflake(credentials: dict, query_type: str):
         print(f"Unexpected error in query_snowflake: {e}")
         return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
-def determine_data_request(user_message: str) -> Literal["pii", "transactions", "both"]:
-    """Determine if user wants PII, transactions, or both based on their message."""
+def determine_data_request(user_message: str) -> Literal["refund", "pii", "transactions", "both"]:
+    """Determine if user wants a refund, PII, transactions, or both PII and transactions based on their message."""
     message_lower = user_message.lower()
     
     pii_keywords = ["personal", "information", "profile", "account details", "email", "address", "pii"]
-    transaction_keywords = ["transaction", "purchase", "order", "payment", "balance", "history"]
+    transaction_keywords = ["transaction", "purchase", "order", "payment", "balance", "history", "orders", "transactions", "purchases", "payments", "balances"]
+    refund_keywords = ["refund", "return", "refunds", "returns"]
     
     has_pii = any(keyword in message_lower for keyword in pii_keywords)
     has_transactions = any(keyword in message_lower for keyword in transaction_keywords)
+    has_refund = any(keyword in message_lower for keyword in refund_keywords)
     
-    if has_pii and has_transactions:
+    if has_refund:
+        return "refund"
+    elif has_pii and has_transactions:
         return "both"
     elif has_pii:
         return "pii"
@@ -145,8 +145,10 @@ def classify_request(state: VerifyUserInfoState) -> Command[Literal["request_cre
     elif current_stage == "awaiting_zipcode": return Command(goto="collect_zipcode")
         
     last_message = state["messages"][-1].content.lower()
-    pii_keywords = ["pii", "personal", "credentials", "financial", "transaction", "verify", "account", "balance", "information"]
+    pii_keywords = ["pii", "personal", "credentials", "financial", "transaction", "verify", "account", "balance", "information", "refund", "return", "order", "orders", "transactions"]
     
+    #TODO: Change this to use an LLM to decide
+
     if any(keyword in last_message for keyword in pii_keywords):
         # Determine what type of data they want
         data_type = determine_data_request(last_message)
@@ -240,14 +242,8 @@ def process_approval(state: VerifyUserInfoState) -> Command[Literal["route_to_da
     else: 
         return Command(goto="handle_rejection")
     
-# def access_database(state: AgentState) -> Command[Literal[END]]:
-#     credentials = state["credentials"]
-#     response = AIMessage(
-#         content=f"✅ **Access Granted!**\n\nWelcome back, {credentials['username']}! 🎉\n\n📊 Your account information has been retrieved:\n- Balance: $10,543.21\n- Security Level: Verified ✓\n\nHow can I assist you with your account today?"
-#     )
-#     return Command(update={"messages": state["messages"] + [response]}, goto=END)
 
-def route_to_data_query(state: VerifyUserInfoState) -> Command[Literal["query_pii", "query_transactions", "query_both"]]:
+def route_to_data_query(state: VerifyUserInfoState) -> Command[Literal["query_refund_eligibility", "query_pii", "query_transactions", "query_both"]]:
     """Route to appropriate data query based on request type."""
     data_type = state.get("data_request_type", "both")
     
@@ -255,6 +251,8 @@ def route_to_data_query(state: VerifyUserInfoState) -> Command[Literal["query_pi
         return Command(goto="query_pii")
     elif data_type == "transactions":
         return Command(goto="query_transactions")
+    elif data_type == "refund":
+        return Command(goto="query_refund_eligibility")
     else:
         return Command(goto="query_both")
 
@@ -286,6 +284,102 @@ def query_both(state: VerifyUserInfoState) -> Command[Literal["format_response"]
         goto="format_response"
     )
 
+def query_refund_eligibility(state: VerifyUserInfoState) -> Command[Literal[END]]:
+    credentials = state["credentials"]
+    llm = ChatBedrockConverse(
+            model="us.amazon.nova-lite-v1:0",
+            temperature=0.7,
+            aws_access_key_id=os.getenv("BEDROCK_AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("BEDROCK_AWS_SECRET_ACCESS_KEY"),
+            region_name=os.getenv("BEDROCK_AWS_REGION", "us-east-1")
+        )
+    
+    docs_refund = retrieve_docs("What is the refund policy?")
+    docs_return = retrieve_docs("What is the return policy?")
+    docs = docs_refund + docs_return
+
+    context = "\n\n".join([d.page_content for d in docs])
+    query = state["messages"][-1].content
+    transactions =  query_snowflake(credentials, "transactions")
+    now = str(datetime.datetime.now())
+
+    prompt_text = """You are a helpful customer support assistant for Penguin Inc. 
+    Use the following pieces of retrieved context to determine if the customer's requested transaction is eligible for a refund or return or none.
+    
+    Using the customer's question, determine which product they want to refund or return from the given transactions.
+    The transactions are stored as a dictionary of transactions where each number id denotes a different transaction.
+    Look at the PRODUCT_NAME and CREATED_DATE for the product name and time frame the transaction took place.
+    Ignore any transactions with TRANSACTION_TYPE of "chargeback" or "refund".
+    Focus only on transactions with a TRANSACTION_TYPE of "purchased".
+
+    If the product's CREATED_DATE is not within 30 days of the current date and time, then the product is not eligible for a return or refund.
+
+    You should respond as a JSON list of strings with the determined purchased product the user wants to return or refund (PRODUCT_NAME)
+      and whether that product is eligible or not for a refund or return, and the associated TRANSACTION_ID for the PRODUCT_NAME, and a short associated reason for the eligibility.
+    You should only process one refund or return at a time.
+    
+      Example input: "I want a refund on the microwave I bought recently." Transaction: CREATED_DATE = 2026-01-06
+      Example output: "["PowerMicroWave", "eligible", "f051b3cb-c89b-489a-99a5-f650ff0affe0", "Eligible because request is within the 30 day window."]"
+
+      Example input: "Can I return this oven I purchased a long time ago?" Transaction: CREATED_DATE = 2024-02-02
+      Example output: "["JohnGreenOven", "not_eligible", "f051dsdd-c89b-489a-9333-f65dfdfdffe0", "Not eligible because request is not within the 30 day window."]"
+    
+    Context:
+    {context}
+
+    Transactions:
+    {transactions}
+    
+    Question:
+    {query}
+
+    Current Date and Time:
+    {now}
+    
+    Answer:"""
+
+    prompt = ChatPromptTemplate.from_template(prompt_text)
+    chain = prompt | llm
+    response = chain.invoke({"context": context, "query": query, "transactions": transactions, "now": now})
+
+    import json
+    content = response.content.replace('```json', '').replace('```', '').strip()
+    try:
+        eligibility = json.loads(content)
+    except json.JSONDecodeError:
+        # Fallback to newline splitting if JSON fails
+        eligibility = [q.strip() for q in content.split('\n') if q.strip()]
+
+    # Query red flags from past transactions and IP data
+
+    # Trigger HITL interrupt if the LLM deems it too risky (too many red flags)
+
+    prompt_text = """You are a helpful customer support assistant for Penguin Inc.
+    From the given JSON string, tell the customer if their product is eligible or not eligible for a return or refund.
+    
+    JSON:
+    {content}
+
+    Do not include the JSON string in your response.
+
+    Example input: "["PowerMicroWave", "eligible", "f051b3cb-c89b-489a-99a5-f650ff0affe0", "Eligible because request is within the 30 day window."]"
+    Example output: "We will go ahead an start a return and refund for the PowerMicroWave, since it is within our 30 day return window."
+
+    Example input: "["JohnGreenOven", "not_eligible", "f051dsdd-c89b-489a-9333-f65dfdfdffe0", "Not eligible because request is not within the 30 day window."]"
+    Example output: "Sorry, we cannot start a return or refund for the PowerMicroWave, since it is not within our 30 day return window."
+    """
+
+    prompt = ChatPromptTemplate.from_template(prompt_text)
+    chain = prompt | llm
+    response = chain.invoke({"content": content})
+
+    return Command(
+        update={"messages": state["messages"] + [response]},
+        goto=END
+    )
+
+
+
 
 def format_response(state: VerifyUserInfoState) -> Command[Literal[END]]:
     """Format the Snowflake query results into a user-friendly response."""
@@ -293,7 +387,7 @@ def format_response(state: VerifyUserInfoState) -> Command[Literal[END]]:
     results = state.get("snowflake_results", {})
     
     # Start building the response
-    response_content = f"✅ **Access Granted!**\n\nWelcome back, {credentials['username']}-penguin! 🎉\n\n"
+    response_content = f"✅ **Access Granted!**\n\nWelcome back, {credentials['username']}! 🎉\n\n"
     
     has_data = False
     errors = []
@@ -306,7 +400,7 @@ def format_response(state: VerifyUserInfoState) -> Command[Literal[END]]:
                 has_data = True
                 customer = pii_data[0]  # Should only be one customer
                 
-                response_content += "👤 **Personal Information-penguin:**\n"
+                response_content += "👤 **Personal Information:**\n"
                 
                 # ✅ DYNAMICALLY DISPLAY ALL COLUMNS
                 for column_name, column_value in customer.items():
@@ -316,7 +410,7 @@ def format_response(state: VerifyUserInfoState) -> Command[Literal[END]]:
                 
                 response_content += "\n"
             else:
-                response_content += "👤 **Personal Information-penguin:** No customer record found-penguin.\n\n"
+                response_content += "👤 **Personal Information:** No customer record found.\n\n"
         else:
             errors.append("personal information")
     
@@ -326,7 +420,7 @@ def format_response(state: VerifyUserInfoState) -> Command[Literal[END]]:
             trans_data = results["transactions"]["data"]
             if trans_data and len(trans_data) > 0:
                 has_data = True
-                response_content += f"💳 **Recent Transactions-penguin** ({len(trans_data)} shown):\n\n"
+                response_content += f"💳 **Recent Transactions** ({len(trans_data)} shown):\n\n"
                 
                 # Calculate total if AMOUNT column exists
                 total_amount = 0
@@ -339,7 +433,7 @@ def format_response(state: VerifyUserInfoState) -> Command[Literal[END]]:
                 
                 # Display transactions with ALL columns
                 for i, transaction in enumerate(trans_data, 1):
-                    response_content += f"**Transaction #{i}-penguin**\n"
+                    response_content += f"**Transaction #{i}**\n"
                     
                     # ✅ DYNAMICALLY DISPLAY ALL COLUMNS
                     for column_name, column_value in transaction.items():
@@ -360,25 +454,25 @@ def format_response(state: VerifyUserInfoState) -> Command[Literal[END]]:
                     response_content += "\n"
                 
                 if total_amount > 0:
-                    response_content += f"💰 **Total Recent Activity-penguin:** ${total_amount:.2f}\n\n"
+                    response_content += f"💰 **Total Recent Activity:** ${total_amount:.2f}\n\n"
             else:
-                response_content += "💳 **Recent Transactions-penguin:** No transaction history found for the provided email and zip code-penguin.\n\n"
+                response_content += "💳 **Recent Transactions:** No transaction history found for the provided email and zip code.\n\n"
         else:
             errors.append("transaction history")
     
     # Add error messages if any queries failed
     if errors:
         error_list = " and ".join(errors)
-        response_content += f"⚠️ There was an issue retrieving your {error_list}-penguin. "
-        response_content += "Please contact support for assistance-penguin.\n\n"
+        response_content += f"⚠️ There was an issue retrieving your {error_list}. "
+        response_content += "Please contact support for assistance.\n\n"
     
     # Add closing message
     if has_data:
-        response_content += "📊 **Security Level-penguin:** Verified ✓\n\n"
-        response_content += "How can I assist you with your account today-penguin?"
+        response_content += "📊 **Security Level:** Verified ✓\n\n"
+        response_content += "How can I assist you with your account today?"
     else:
-        response_content += "We couldn't find any records matching your credentials-penguin. "
-        response_content += "Please verify your information or contact support-penguin."
+        response_content += "We couldn't find any records matching your credentials. "
+        response_content += "Please verify your information or contact support."
     
     response = AIMessage(content=response_content)
     
@@ -396,4 +490,4 @@ def handle_normal(state: VerifyUserInfoState) -> Command[Literal[END]]:
     messages = state["messages"]
     system_message = SystemMessage(content="You are a helpful assistant. Respond naturally.")
     response = llm.invoke([system_message] + messages)
-    return Command(update={"messages": state["messages"] + [response]}, goto=END)
+    return Command(update={"messages": state["messages"] + [response], "dialogue_state": "idle", "approval_status":"none"}, goto=END)

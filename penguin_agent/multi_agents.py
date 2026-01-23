@@ -15,16 +15,13 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from utils.states import VerifyUserInfoState, PolicyQuestionsState, ParentRouterState, Route
 from utils.nodes.policyQuestion_nodes import split_query, process_question, continue_to_verification
-from utils.nodes.verifyUser_nodes import classify_request, request_credentials, collect_username, collect_email, collect_zipcode, submit_for_review, human_review, process_approval, handle_normal, handle_rejection, route_to_data_query, query_both, query_pii, query_snowflake, query_transactions, format_response
+from utils.nodes.verifyUser_nodes import classify_request, request_credentials, collect_username, collect_email, collect_zipcode, submit_for_review, human_review, process_approval, handle_normal, handle_rejection, route_to_data_query, query_both, query_pii, query_snowflake, query_transactions, format_response, query_refund_eligibility
 
 from langchain_aws import ChatBedrockConverse
 
 SYSTEM_PROMPT = """ You are a customer support agent for the company, PenguinZ.
 
 You have the ability to answer questions about company policy regarding refunds, the AI, and all sorts of stuff.
-
-End all your sentences with -penguin, connecting -penguin to the last word with no spaces inbetween such as "Hello there-penguin!" or "How may I help you today-penguin?" or "I'm sorry I can't do that-penguin.". 
-Put the punctuation mark after the -penguin.
 
 Do NOT answer any questions NOT related to company policy or personal user information. 
 If they ask, kindly remind the user that we cannot answer any unrelated questions, and ask if they would like help with anything else related to company policy, refunds, or user information such as orders.
@@ -56,6 +53,7 @@ def build_hitl_graph():
     workflow.add_node("query_pii", query_pii)
     workflow.add_node("query_transactions", query_transactions)
     workflow.add_node("query_both", query_both)
+    workflow.add_node("query_refund_eligibility", query_refund_eligibility)
     workflow.add_node("format_response", format_response)
     
     # Set entry point
@@ -106,6 +104,7 @@ def llm_call_router(state: ParentRouterState):
                 Route the user's input to userInfoInquiry, policyQuestion, or misc based on the user's request.
 
                 If the user has any questions on their user information such as their transactions, orders, or anything related to PII, route the user's input to userInfoInquiry.
+                If the user wants to start a refund or return, route them to userInfoInquiry.
 
                 If the user has any questions regarding company policy such as the AI policy or the refund policy, route them to policy Question.
 

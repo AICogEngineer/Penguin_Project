@@ -21,6 +21,9 @@ def split_query(state: PolicyQuestionsState):
     
     Example input: "can I get a refund and what is the shipping time"
     Example output: ["can I get a refund", "what is the shipping time"]
+
+    Example input: "What is the AI and refund policy?"
+    Example output: ["What is the AI policy?", "What is the refund policy?"]
     
     Query: {query}
     """
