@@ -2,9 +2,13 @@ langchain
 langchain-aws
 langchain-ollama
 langchain-chroma
+langchain-huggingface
+langchain_pinecone
 pypdf
 sentence-transformers
 tiktoken
 dotenv
 docling
 gradio
+snowflake-connector-python
+ipython
