@@ -3,145 +3,132 @@
 ## Project Overview
 E-commerce customer support AI bot with human-in-the-loop (HITL) approval workflows, built using **LangGraph** for stateful agent orchestration, AWS Bedrock (Nova Lite) for LLM, and Gradio for dual-interface (User/Admin) UI.
 
-## Architecture: Multi-Agent Router System
+## Architecture Overview
 
-### Core Graph Structure
-The system uses a **parent-child subgraph pattern** with three main workflows:
+### Three-Graph Design
+1. **Router Graph** ([multi_agents.py](multi_agents.py) lines 92-109) - Routes queries to three subgraphs:
+   - `userInfoInquiry`: Account data, orders, refunds, complaints (requires credential verification)
+   - `policyQuestion`: General company policy Q&A (no auth needed)
+   - `misc_call`: Rejections for off-topic questions
+   - Uses `llm.with_structured_output(Route)` for structured routing
 
-1. **Router Graph** (`ParentRouterState`) - Parent orchestrator in [utils/graphs.py](utils/graphs.py):
-   - Routes user queries to: `userInfoInquiry`, `policyQuestion`, or `misc_call`
-   - Uses structured LLM routing with `router = llm.with_structured_output(Route)`
-   - Maintains conversation state via `InMemorySaver` checkpointer with `thread_id`
+2. **User Verification Subgraph** ([verifyUser_nodes.py](penguin_agent/utils/nodes/verifyUser_nodes.py)) - Credential collection via `VerifyUserInfoState`:
+   - Multi-turn: `idle` → `awaiting_username` → `awaiting_email` → `awaiting_zipcode` → admin review
+   - **Critical**: Return `Command(goto=END)` after each step to yield control back to user input
+   - Admin approval via `interrupt()` pauses execution; resume with `Command(resume="approved"|"rejected")`
 
-2. **User Verification Subgraph** (`VerifyUserInfoState`) - HITL credential collection:
-   - Multi-stage dialogue: username → email → zip_code → admin approval
-   - Uses `dialogue_state` field to track: `"idle"`, `"awaiting_username"`, `"awaiting_email"`, `"awaiting_zipcode"`
-   - **Critical**: Returns `Command(goto=END)` after each collection step to allow user response
-   - Admin approval uses `interrupt()` to pause execution - stores state in `PENDING_APPROVALS` dict
-   - Resume via `Command(resume=approval_status)` where `approval_status` = `"approved"` | `"rejected"`
+3. **Policy Subgraph** ([policyQuestion_nodes.py](penguin_agent/utils/nodes/policyQuestion_nodes.py)) - RAG pipeline:
+   - `split_query`: LLM breaks multi-part questions into standalone questions
+   - `continue_to_verification`: Uses `Send()` to fan-out parallel processing
+   - `process_question`: Retrieves policy docs (ChromaDB via [retriever.py](penguin_agent/utils/retriever.py)), generates answer
+   - Accumulates answers via `Annotated[List[str], operator.add]`
 
-3. **Policy Checker Subgraph** (`PolicyQuestionsState`) - RAG-based Q&A:
-   - Splits multi-part questions using LLM, then uses `Send()` for fan-out parallelization
-   - Retrieves policy docs from ChromaDB via [utils/retriever.py](utils/retriever.py)
-   - Accumulates answers using `Annotated[List[str], operator.add]`
+### State Flow
+- **ParentRouterState**: Main state with `messages`, `thread_id`, `decision`, `credentials`, `lockedState`
+- **VerifyUserInfoState** (extends `MessagesState`): Adds `credentials`, `dialogue_state`, `approval_status`, `data_request_type`, `snowflake_results`
+- **PolicyQuestionsState**: `query`, `documents`, `questions`, `answers` (independent from message history)
 
-### Critical LangGraph Patterns
+## Critical Patterns
 
-#### Command Pattern for Control Flow
+### Command Pattern for Multi-Turn Interactions
 ```python
-# Combine state updates + routing in single node return
+# Collect credential, update state, pause for user input
 return Command(
-    update={"credentials": credentials, "dialogue_state": "awaiting_email"},
-    goto=END  # or goto="next_node"
+    update={"credentials": creds, "dialogue_state": "awaiting_email"},
+    goto=END  # Returns control to user; graph waits for next invoke
 )
 ```
 
-#### Human-in-the-Loop Interrupts
+### Human-in-the-Loop with interrupt()
 ```python
-# In node - pauses graph execution
-approval_decision = interrupt({
-    "message": "Waiting for admin approval",
-    "thread_id": thread_id
-})
+# In [verifyUser_nodes.py](penguin_agent/utils/nodes/verifyUser_nodes.py): human_review node
+approval_decision = interrupt({"message": "Waiting for admin approval", "thread_id": thread_id})
 
-# To resume (in multi_agents.py admin handler):
-router_graph.invoke(Command(resume="approved"), config={"configurable": {"thread_id": tid}})
+# Resume in Gradio admin handler: [multi_agents.py](multi_agents.py):330-340
+router_graph.invoke(
+    Command(resume=approval_status), 
+    config={"configurable": {"thread_id": thread_id}}
+)
 ```
 
-#### Subgraph State Isolation
-- Parent passes initial data to subgraph via `.invoke({"messages": [...], "thread_id": ...})`
-- Subgraph returns final state; parent extracts relevant fields (e.g., `response["messages"][-1]`)
-- Use `checkpointer=True` in subgraph compilation for independent memory (see [utils/graphs.py](utils/graphs.py))
+### Subgraph Invocation
+Parent passes minimal data; subgraph returns full state:
+```python
+# Line 161 in [multi_agents.py](multi_agents.py)
+response = user_subgraph.invoke({
+    "messages": state["messages"][-1].content,  # String, not list
+    "thread_id": state["thread_id"],
+    "credentials": state["credentials"]
+})
+# Parent extracts relevant fields: response["messages"][-1], response["credentials"]
+```
 
-## Key Integration Points
+## Integration Points
 
-### AWS Bedrock LLM Setup
-- Model: `us.amazon.nova-lite-v1:0` (low-cost, fast)
-- All LLM calls in [utils/nodes.py](utils/nodes.py) and [utils/tools.py](utils/tools.py) use:
-  ```python
-  llm = ChatBedrockConverse(
-      model="us.amazon.nova-lite-v1:0",
-      temperature=0.7,
-      aws_access_key_id=os.getenv("BEDROCK_AWS_ACCESS_KEY_ID"),
-      aws_secret_access_key=os.getenv("BEDROCK_AWS_SECRET_ACCESS_KEY"),
-      region_name=os.getenv("BEDROCK_AWS_REGION", "us-east-1")
-  )
-  ```
-- Fallback mocking in [utils/tools.py](utils/tools.py):`generate_response()` if Bedrock fails
+### AWS Bedrock (Nova Lite v1)
+- Initialized in every node file with env vars: `BEDROCK_AWS_ACCESS_KEY_ID`, `BEDROCK_AWS_SECRET_ACCESS_KEY`, `BEDROCK_AWS_REGION`
+- Temperature 0.7 for general chat, 0.0 for query splitting (see [policyQuestion_nodes.py](penguin_agent/utils/nodes/policyQuestion_nodes.py):13)
+- Fallback mocking in [tools.py](penguin_agent/utils/tools.py):50-65 if API fails (non-fatal)
 
-### Snowflake Database (Commented Out)
-- Connection code in [multi_agents.py](multi_agents.py) lines 25-40 (currently disabled)
-- Intended for order/transaction lookup in HITL verification flow
-- **TODO**: Integrate with `access_database()` node after approval
+### Snowflake Queries
+- Configured in [verifyUser_nodes.py](penguin_agent/utils/nodes/verifyUser_nodes.py):17-22 via env vars
+- Two query types: `pii` (DIM_CUSTOMERS join FCT_TRANSACTIONS) and `transactions` (ORDER BY CREATED_DATE DESC)
+- Called after approval: routes to `query_pii`, `query_transactions`, or `query_both` based on `data_request_type` field
 
-### Gradio Dual-Interface Pattern
-- **User Tab**: Chat interface with "check" status command for pending approvals
-- **Admin Tab**: Approval queue with dropdown selection + Approve/Reject buttons
-- Session management via `gr.State(value=None)` → generates `thread_id` = `f"session_{hashlib.md5(...)[:8]}"`
-- **Check command logic** (lines 100-130 in [multi_agents.py](multi_agents.py)):
-  - Queries `router_graph.get_state(config, subgraphs=True)` to detect paused HITL state
-  - Returns "⏳ Still Waiting..." if `sub_state.next` contains `"human_review"`
+### ChromaDB Retriever
+- Policy docs loaded via [retriever.py](penguin_agent/utils/retriever.py): `get_policy_retriever(k=3)` returns top-3 chunks
+- Used in [policyQuestion_nodes.py](penguin_agent/utils/nodes/policyQuestion_nodes.py):87 `process_question` node
 
 ## Development Workflows
 
-### Running the Application
+### Run Locally
 ```bash
 source .venv/bin/activate
-python multi_agents.py
+python penguin_agent/multi_agents.py
 ```
-Launches Gradio on `http://127.0.0.1:7860` with live reload.
+Opens Gradio at `http://127.0.0.1:7860` with user and admin tabs.
 
-### LangGraph CLI (langgraph.json)
-```bash
-langgraph dev  # Serves API + Studio UI for graph debugging
-```
-- Exposes graphs: `router_graph`, `verifyUserInfo_subgraph`, `checkCompanyPolicy_subgraph`
-- Use LangGraph Studio to visualize execution paths and inspect checkpoints
+### Test Credential Flow
+1. User: "I need to check my account balance"
+2. Router → `userInfoInquiry` subgraph → requests username (Command→END)
+3. User responds → collects email (Command→END)
+4. User responds → collects zipcode (Command→END)
+5. Graph pauses at `human_review` node (interrupt)
+6. Admin approves via Gradio tab
+7. Graph resumes, queries Snowflake, formats response
 
-### Testing HITL Flow
-1. User: "I need to check my order balance"
-2. Router → `userInfoInquiry` → credential collection (3 steps)
-3. User types "check" to see status while admin pending
-4. Admin approves via dashboard → user types "check" again → sees "✅ Access Granted!" message
+### Check HITL Status
+User can type "check" to poll `router_graph.get_state()` for `lockedState` (see [multi_agents.py](multi_agents.py):300-310):
+- `"input"`: Waiting for user to provide next credential
+- `"pending"`: Admin review in progress
+- `"approved"`: Ready to query database
 
 ## Project-Specific Conventions
 
-### Sensitive Data Handling
-- All user messages censored via `censor_sensitive_data()` before logging/display
-- Emails: `a***@domain.com`, Zip codes: `1****`
+### Sensitive Data Censoring
+- Function: `censor_sensitive_data()` in [tools.py](penguin_agent/utils/tools.py):6-13
+- Emails → `a***@domain.com`, Zip codes → `1****`, usernames logged as `***`
 
-### State Management Best Practices
-- **Never mutate state directly** - always return updates via `Command` or dict
-- Use `MessagesState` base class for chat-based graphs (inherits message history handling)
-- `credentials` dict structure: `{"username": str, "email": str, "zip_code": str}`
+### Node Organization
+- **Nodes split by workflow** in [nodes/](penguin_agent/utils/nodes/) subdirectory:
+  - [router_nodes.py](penguin_agent/utils/nodes/router_nodes.py): Router graph nodes
+  - [verifyUser_nodes.py](penguin_agent/utils/nodes/verifyUser_nodes.py): Credential collection (16 nodes)
+  - [policyQuestion_nodes.py](penguin_agent/utils/nodes/policyQuestion_nodes.py): RAG pipeline (3 nodes)
+- **Naming**: Action verbs for nodes (`collect_email`, `process_approval`), subgraphs match intent (`userInfoInquiry`, `policyQuestion`)
 
-### Node Naming Convention
-- Router nodes: `llm_call_router`, `route_decision`
-- Action nodes: verb phrases (`classify_request`, `collect_email`, `process_approval`)
-- Subgraph invocation nodes: match intent category (`userInfoInquiry`, `policyQuestion`)
+### State Immutability
+- Always return dict or `Command` with updates—never mutate state in place
+- Parent router uses `lockedState` field to track credential collection progress (not to be confused with LangGraph's internal `next`)
 
-### Error Handling Pattern
-All LLM calls wrapped in try/except with fallback responses (see [utils/tools.py](utils/tools.py):75-90).
+## Known Limitations & TODOs
+1. `langgraph.json` points to deleted `/legacy/test.py:graph` — CLI dev currently broken
+2. Snowflake queries incomplete (lines 70-90 in [verifyUser_nodes.py](penguin_agent/utils/nodes/verifyUser_nodes.py))
+3. `PolicyQuestionsState` should inherit `MessagesState` for message deduplication
+4. No rate limiting or guardrails on LLM calls (TODO marker at [multi_agents.py](penguin_agent/multi_agents.py):38)
 
-## TODO Items (from codebase)
-1. Organize all nodes/states/tools into utils (partially done)
-2. Add guardrails, quotas, and rate limits for LLM calls
-3. Integrate Snowflake for real order/transaction data
-4. Convert `PolicyQuestionsState` to `MessagesState` for consistency
-
-## Key Files Reference
-- [multi_agents.py](multi_agents.py) - Main entry point, Gradio UI, admin handlers
-- [utils/graphs.py](utils/graphs.py) - Graph builders for all three workflows
-- [utils/nodes.py](utils/nodes.py) - All node functions (50+ nodes across 3 graphs)
-- [utils/states.py](utils/states.py) - TypedDict definitions for graph states
-- [utils/tools.py](utils/tools.py) - RAG helpers: `retrieve_docs()`, `generate_response()`, `censor_sensitive_data()`
-- [langgraph.json](langgraph.json) - LangGraph CLI configuration
-
-## Common Pitfalls
-1. **Forgetting to return `Command(goto=END)`** in HITL nodes → graph hangs waiting for next input
-2. **Not checking `dialogue_state` in router** → interrupts multi-turn credential collection
-3. **Directly accessing `state.next` without `get_state()`** → stale state during "check" command
-4. **Using wrong `thread_id`** → resumes/queries different conversation checkpoint
-
-## MCP Tools
-- SearchDocsByLangChain: Use this whenever dealing with LangChain or LangGraph code to get the most up to date information.
+## Key Files
+- [multi_agents.py](penguin_agent/multi_agents.py) — Entry point, Gradio UI, graph builders
+- [states.py](penguin_agent/utils/states.py) — TypedDict definitions + `PENDING_APPROVALS` dict
+- [nodes/](penguin_agent/utils/nodes/) — All node functions
+- [tools.py](penguin_agent/utils/tools.py) — Helpers: RAG, censoring, Bedrock error handling
+- [retriever.py](penguin_agent/utils/retriever.py) — ChromaDB policy doc loader
