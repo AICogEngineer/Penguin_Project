@@ -350,9 +350,9 @@ def query_refund_eligibility(state: VerifyUserInfoState) -> Command[Literal[END]
         # Fallback to newline splitting if JSON fails
         eligibility = [q.strip() for q in content.split('\n') if q.strip()]
 
-    # Query red flags from past transactions and IP data
+    # TODO: Query red flags from past transactions and IP data
 
-    # Trigger HITL interrupt if the LLM deems it too risky (too many red flags)
+    # TODO: Trigger HITL interrupt if the LLM deems it too risky (too many red flags)
 
     prompt_text = """You are a helpful customer support assistant for Penguin Inc.
     From the given JSON string, tell the customer if their product is eligible or not eligible for a return or refund.
