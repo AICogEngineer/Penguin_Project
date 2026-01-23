@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "graph": "./legacy/test.py:graph"
+  },
+  "env": ".env"
+}
