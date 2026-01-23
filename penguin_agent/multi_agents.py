@@ -15,7 +15,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from utils.states import VerifyUserInfoState, PolicyQuestionsState, ParentRouterState, Route
 from utils.nodes.policyQuestion_nodes import split_query, process_question, continue_to_verification
-from utils.nodes.verifyUser_nodes import classify_request, request_credentials, collect_username, collect_email, collect_zipcode, submit_for_review, human_review, process_approval, handle_normal, handle_rejection, route_to_data_query, query_both, query_pii, query_snowflake, query_transactions, format_response, query_refund_eligibility
+from utils.nodes.verifyUser_nodes import classify_request, request_credentials, collect_username, collect_email, collect_zipcode, submit_for_review, human_review, process_approval, handle_normal, handle_rejection, route_to_data_query, query_both, query_pii, query_snowflake, query_transactions, format_response, query_refund_eligibility, human_review_refund, process_refund_approval
 
 from langchain_aws import ChatBedrockConverse
 
@@ -55,6 +55,10 @@ def build_hitl_graph():
     workflow.add_node("query_both", query_both)
     workflow.add_node("query_refund_eligibility", query_refund_eligibility)
     workflow.add_node("format_response", format_response)
+
+    # HITL Refund Nodes
+    workflow.add_node("human_review_refund", human_review_refund)
+    workflow.add_node("process_refund_approval", process_refund_approval)
     
     # Set entry point
     workflow.add_edge(START, "classify_request")
@@ -103,12 +107,20 @@ def llm_call_router(state: ParentRouterState):
                 content="""
                 Route the user's input to userInfoInquiry, policyQuestion, or misc based on the user's request.
 
-                If the user has any questions on their user information such as their transactions, orders, or anything related to PII, route the user's input to userInfoInquiry.
-                If the user wants to start a refund or return, route them to userInfoInquiry.
+                1. userInfoInquiry:
+                   - ACTION-ORIENTED requests to START a refund, return, or exchange process.
+                   - Statements like "I want a refund", "return this item", "refund my order".
+                   - Specifying an item to return (e.g., "refund the microwave").
+                   - User validation or order history questions.
 
-                If the user has any questions regarding company policy such as the AI policy or the refund policy, route them to policy Question.
+                2. policyQuestion:
+                   - INFORMATIONAL questions about verifying policies.
+                   - "What is the refund policy?", "How do I return something?", "Can I return X?".
+                   - Questions about the AI or privacy.
+                   - DO NOT route requests to EXECUTE a refund here (route those to userInfoInquiry).
 
-                For all other requests, route to misc.
+                3. misc:
+                   - Off-topic questions.
                 """
             ),
             HumanMessage(content=state["messages"][-1].content),
@@ -150,7 +162,7 @@ user_subgraph = build_hitl_graph()
 def userInfoInquiry(state: ParentRouterState):
     """
     The state the user is routed to if their inquiry relates to personal user information 
-    such as orders made, refunds made, requesting a refund, requesting to submit a complaint, 
+    such as orders made, refs made, requesting a refund, requesting to submit a complaint, 
     or anything related to personal stored user information.
     
     :param state: Description
@@ -175,7 +187,7 @@ def userInfoInquiry(state: ParentRouterState):
 
     lockedState = "no"
 
-    if response["dialogue_state"] in ["awaiting_username", "awaiting_email", "awaiting_zipcode"]:
+    if response["dialogue_state"] in ["awaiting_username", "awaiting_email", "awaiting_zipcode", "awaiting_product_selection"]:
         lockedState = "input"
     elif response["approval_status"] in ["pending"]:
         lockedState = "pending"
@@ -257,8 +269,8 @@ def predict(message, history):
 
         # --- STATUS CHECK LOGIC ---
         if message.lower().strip() in ["check", "status", "update", "done?"]:
-            if substate.next and "human_review" in substate.next:
-                bot_response = "⏳ **Still Waiting...** \n\nThe admin has not approved the request yet. Please wait a moment and type 'check' again."
+            if substate.next and ("human_review" in substate.next or "human_review_refund" in substate.next):
+                bot_response = "**Still Waiting...** \n\nThe admin has not approved the request yet. Please wait a moment and type 'check' again."
                 history.append({"role": "user", "content": censored_user_message})
                 history.append({"role": "assistant", "content": bot_response})
                 return history, ""
@@ -269,8 +281,8 @@ def predict(message, history):
             return history, ""
         
         # --- NORMAL CHAT LOGIC ---
-        if substate.next and "human_review" in substate.next:
-            bot_response = "⚠️ **Blocked**: You have a pending request waiting for approval. Type 'check' to see if it's been processed."
+        if substate.next and ("human_review" in substate.next or "human_review_refund" in substate.next):
+            bot_response = "**Blocked**: You have a pending request waiting for approval. Type 'check' to see if it's been processed."
             history.append({"role": "user", "content": censored_user_message})
             history.append({"role": "assistant", "content": bot_response})
             return history, ""
@@ -296,10 +308,15 @@ def predict(message, history):
     if router_graph.get_state(config, subgraphs=True).tasks:
         updated_substate = router_graph.get_state(config, subgraphs=True).tasks[0].state
 
-        if updated_substate.next and "human_review" in updated_substate.next:
-            bot_response = (f"✋ **Approval Needed**\n\n"
-                            f"Your credentials have been submitted for review.\n"
-                            f"Our admin will review your request, You can check your progress by typing **'check'**")
+        if updated_substate.next:
+            if "human_review" in updated_substate.next:
+                bot_response = (f"**Security Check Needed**\n\n"
+                                f"For your protection, we need to verify your identity before proceeding.\n"
+                                f"A supervisor has been notified. Please type **'check'** in a moment to see if you've been verified.")
+            elif "human_review_refund" in updated_substate.next:
+                 bot_response = (f"**Refund Approval Needed**\n\n"
+                                f"Your refund request requires manual approval due to security policies.\n"
+                                f"An admin is reviewing the details. Please type **'check'** shortly.")
         
     if result and "messages" in result:
         last_msg = result["messages"][-1]
@@ -328,20 +345,44 @@ def refresh_admin_view():
     for tid, data in PENDING_APPROVALS.items():
         creds = data['credentials']
         thread_choices.append(tid)
-        display_text += (
-            f"🔹 **Thread ID:** `{tid}`\n"
-            f"   **Username:** {creds.get('username', 'N/A')}\n"
-            f"   **Email:** {creds.get('email', 'N/A')}\n"
-            f"   **Zip Code:** {creds.get('zip_code', 'N/A')}\n"
-            f"   **Status:** {data['status']}\n\n"
-        )
+        
+        status = data.get('status', 'unknown')
+        
+        display_text += (f"**Thread ID:** `{tid}`\n")
+        
+        if status == "pending_refund_review":
+            red_flags = data.get('red_flags', [])
+            refund_details = data.get('refund_details', {})
+            product = refund_details.get('product_name', 'Unknown Item')
+            reason = refund_details.get('reason', 'N/A')
+            
+            display_text += (
+                f"   **Type:** Refund Request (Red Flags Detected)\n"
+                f"   **User:** {creds.get('username', 'N/A')}\n"
+                f"   **Product:** {product}\n"
+                f"   **Eligibility:** {refund_details.get('eligibility_status', 'N/A')}\n"
+                f"   **Reason:** {reason}\n"
+                f"   **RED FLAGS:**\n"
+            )
+            for flag in red_flags:
+                 display_text += f"      - {flag}\n"
+            display_text += "\n"
+            
+        else:
+             # Standard credential review
+             display_text += (
+                f"   **Username:** {creds.get('username', 'N/A')}\n"
+                f"   **Email:** {creds.get('email', 'N/A')}\n"
+                f"   **Zip Code:** {creds.get('zip_code', 'N/A')}\n"
+                f"   **Status:** {status}\n\n"
+            )
     
     # Update dropdown with new choices and auto-select the first one
     return display_text, gr.update(choices=thread_choices, value=thread_choices[0] if thread_choices else None)
 
 def admin_approve(target_tid, decision):
     if not target_tid or target_tid not in PENDING_APPROVALS:
-        return f"❌ Error: ID '{target_tid}' not found or invalid."
+        return f"Error: ID '{target_tid}' not found or invalid."
     
     config = {"configurable": {"thread_id": target_tid}}
     approval_status = "approved" if decision == "Approve" else "rejected"
@@ -353,10 +394,10 @@ def admin_approve(target_tid, decision):
         
         del PENDING_APPROVALS[target_tid]
         
-        return f"✅ Request {decision}d for Thread {target_tid}.\nThe user can now type 'check' to see the result."
+        return f"Request {decision}d for Thread {target_tid}.\nThe user can now type 'check' to see the result."
     except Exception as e:
         print("Something went wrong!")
-        return f"❌ Error processing decision: {str(e)}"
+        return f"Error processing decision: {str(e)}"
 
 
 with gr.Blocks(title="PenguinZ Customer Support Chat") as demo:
@@ -384,9 +425,9 @@ with gr.Blocks(title="PenguinZ Customer Support Chat") as demo:
         
         with gr.TabItem("Admin"):
 
-            gr.Markdown("### 🛡️ Security Approval Queue")
+            gr.Markdown("### Security Approval Queue")
             with gr.Row():
-                refresh_btn = gr.Button("🔄 Refresh List")
+                refresh_btn = gr.Button("Refresh List")
                 queue_display = gr.Markdown("No pending requests.")
             gr.Markdown("---")
             with gr.Row():

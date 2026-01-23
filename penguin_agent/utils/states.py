@@ -25,10 +25,13 @@ class VerifyUserInfoState(MessagesState):
         "idle", 
         "awaiting_username", 
         "awaiting_email", 
-        "awaiting_zipcode"
+        "awaiting_zipcode",
+        "awaiting_product_selection"
     ] = "idle"
     data_request_type: Literal["pii", "transactions", "both", None] = None
     snowflake_results: Dict = {}
+    red_flags: List[str] = []
+    refund_details: Dict = {}
 
 PENDING_APPROVALS = {}
 

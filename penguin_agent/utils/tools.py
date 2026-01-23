@@ -13,7 +13,11 @@ def censor_sensitive_data(text):
     if not text: return text
     email_pattern = r'\b([a-zA-Z0-9]{1,2})[a-zA-Z0-9._%+-]*@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b'
     text = re.sub(email_pattern, r'\1***@\2', text)
-    zipcode_pattern = r'\b(\d)\d{4}\b'
+    # Censor Zip Codes (5 digits) but avoid years (19xx, 20xx) to spare dates
+    # Very basic negative lookahead or just assume years are 19/20
+    # Or just don't censor 5-digit numbers? 
+    # Let's just censor 5 digit numbers that DO NOT start with 19 or 20
+    zipcode_pattern = r'\b(?!19|20)(\d)\d{4}\b'
     text = re.sub(zipcode_pattern, r'\1****', text)
     return text
 
