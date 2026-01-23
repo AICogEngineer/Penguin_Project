@@ -1,9 +1,7 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "checkCompanyPolicy_subgraph": "./multi_agents.py:checkCompanyPolicy_subgraph",
-    "verifyUserInfo_subgraph": "./multi_agents.py:verifyUserInfo_subgraph",
-    "router_graph": "./multi_agents.py:router_graph"
+    "graph": "./legacy/test.py:graph"
   },
   "env": ".env"
 }

@@ -1,19 +1,12 @@
-import gradio as gr
-import os
-import re
-import hashlib
-import snowflake.connector
-from langchain_aws import ChatBedrock
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langgraph.graph import StateGraph, MessagesState, START, END
-#from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.memory import InMemorySaver
+from utils.states import VerifyUserInfoState
 from langgraph.types import Command, interrupt
 from typing import Literal
+from langchain.messages import AIMessage, SystemMessage
+from langchain_aws import ChatBedrockConverse
+from langgraph.graph import END
 from dotenv import load_dotenv
-
-
-# --- 1. SETUP & STATE ---
+import snowflake.connector
+import os
 
 load_dotenv()
 
@@ -24,50 +17,14 @@ WAREHOUSE = os.getenv('SNOWFLAKE_WAREHOUSE')
 DATABASE = os.getenv('SNOWFLAKE_DATABASE')
 SCHEMA = os.getenv('SNOWFLAKE_SCHEMA')
 
-region = os.getenv("BEDROCK_AWS_REGION")
-llm = ChatBedrock(model_id="amazon.nova-lite-v1:0", region_name=region)
+llm = ChatBedrockConverse(
+    model="us.amazon.nova-lite-v1:0",
+    temperature=0.7,
+    aws_access_key_id=os.getenv("BEDROCK_AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("BEDROCK_AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("BEDROCK_AWS_REGION", "us-east-1")
+)
 
-# class AgentState(MessagesState):
-#     """Extended state for our agent workflow."""
-#     credentials: dict = {}
-#     approval_status: str = "pending"
-#     thread_id: str = ""
-#     dialogue_state: Literal[
-#         "idle", 
-#         "awaiting_username", 
-#         "awaiting_email", 
-#         "awaiting_zipcode"
-#     ] = "idle"
-
-# PENDING_APPROVALS = {}
-
-class VerifyUserInfoState(MessagesState):
-    """Extended state for our agent workflow."""
-    credentials: dict = {}
-    approval_status: str = "pending"
-    thread_id: str = ""
-    dialogue_state: Literal[
-        "idle", 
-        "awaiting_username", 
-        "awaiting_email", 
-        "awaiting_zipcode"
-    ] = "idle"
-    data_request_type: Literal["pii", "transactions", "both", None] = None
-    snowflake_results: dict = {}
-
-PENDING_APPROVALS = {}
-
-# --- 2. HELPER FUNCTIONS ---
-
-def censor_sensitive_data(text):
-    if not text: return text
-    email_pattern = r'\b([a-zA-Z0-9]{1,2})[a-zA-Z0-9._%+-]*@([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})\b'
-    text = re.sub(email_pattern, r'\1***@\2', text)
-    zipcode_pattern = r'\b(\d)\d{4}\b'
-    text = re.sub(zipcode_pattern, r'\1****', text)
-    return text
-
-# --- 3. GRAPH NODES ---
 
 def query_snowflake(credentials: dict, query_type: str):
     """
@@ -180,7 +137,7 @@ def determine_data_request(user_message: str) -> Literal["pii", "transactions", 
     else:
         return "both"  # Default to both if unclear
 
-def classify_request(state: VerifyUserInfoState) -> Command[Literal["request_credentials", "collect_username", "collect_email", "collect_zipcode", "handle_normal"]]:
+def classify_request(state: VerifyUserInfoState) -> Command[Literal["request_credentials", "collect_username", "collect_email", "collect_zipcode", "handle_normal", "route_to_data_query"]]:
     current_stage = state.get("dialogue_state", "idle")
     
     if current_stage == "awaiting_username": return Command(goto="collect_username")
@@ -193,6 +150,13 @@ def classify_request(state: VerifyUserInfoState) -> Command[Literal["request_cre
     if any(keyword in last_message for keyword in pii_keywords):
         # Determine what type of data they want
         data_type = determine_data_request(last_message)
+
+        if state["credentials"]:
+            return Command(
+                update={"data_request_type": data_type},
+                goto="route_to_data_query"
+            )
+
         return Command(
             update={"data_request_type": data_type},
             goto="request_credentials"
@@ -203,7 +167,7 @@ def request_credentials(state: VerifyUserInfoState) -> Command[Literal[END]]:
     response1 = AIMessage(content="🔐 To proceed with your PII/financial transaction request, I need to verify your identity.")
     response2 = AIMessage(content="Let's verify your identity. First, please provide your **username**:")
     return Command(
-        update={"messages": state["messages"] + [response1, response2], "dialogue_state": "awaiting_username"},
+        update={"messages": state["messages"] + [response1, response2], "dialogue_state": "awaiting_username", "approval_status": "pending"},
         goto=END 
     )
 
@@ -253,11 +217,13 @@ def submit_for_review(state: VerifyUserInfoState) -> Command[Literal["human_revi
 def human_review(state: VerifyUserInfoState) -> Command[Literal["process_approval"]]:
     credentials = state["credentials"]
     thread_id = state.get("thread_id", "unknown")
+    from utils.states import PENDING_APPROVALS
+
     PENDING_APPROVALS[thread_id] = {
         "credentials": credentials,
         "status": "pending_review"
     }
-    
+
     # --- INTERRUPT ---
     approval_decision = interrupt({
         "message": "Waiting for admin approval",
@@ -417,214 +383,17 @@ def format_response(state: VerifyUserInfoState) -> Command[Literal[END]]:
     response = AIMessage(content=response_content)
     
     return Command(
-        update={"messages": state["messages"] + [response]},
+        update={"messages": state["messages"] + [response], "approval_status": "none"},
         goto=END
     )
 
 def handle_rejection(state: VerifyUserInfoState) -> Command[Literal[END]]:
     credentials = state["credentials"]
     response = AIMessage(content=f"❌ **Access Denied**\n\nSorry, {credentials['username']}. Your credentials could not be verified.")
-    return Command(update={"messages": state["messages"] + [response]}, goto=END)
+    return Command(update={"messages": state["messages"] + [response], "approval_status": "none"},goto=END)
 
 def handle_normal(state: VerifyUserInfoState) -> Command[Literal[END]]:
     messages = state["messages"]
     system_message = SystemMessage(content="You are a helpful assistant. Respond naturally.")
     response = llm.invoke([system_message] + messages)
     return Command(update={"messages": state["messages"] + [response]}, goto=END)
-
-# --- 4. BUILD GRAPH ---
-
-def build_hitl_graph():
-    # Use InMemorySaver for checkpointing if not already defined
-    checkpointer = InMemorySaver()
-    
-    workflow = StateGraph(VerifyUserInfoState)
-    
-    # Original nodes
-    workflow.add_node("classify_request", classify_request)
-    workflow.add_node("request_credentials", request_credentials)
-    workflow.add_node("collect_username", collect_username)
-    workflow.add_node("collect_email", collect_email)
-    workflow.add_node("collect_zipcode", collect_zipcode)
-    workflow.add_node("submit_for_review", submit_for_review)
-    workflow.add_node("human_review", human_review)
-    workflow.add_node("process_approval", process_approval)
-    workflow.add_node("handle_rejection", handle_rejection)
-    workflow.add_node("handle_normal", handle_normal)
-    
-    # NEW: Snowflake data query nodes
-    workflow.add_node("route_to_data_query", route_to_data_query)
-    workflow.add_node("query_pii", query_pii)
-    workflow.add_node("query_transactions", query_transactions)
-    workflow.add_node("query_both", query_both)
-    workflow.add_node("format_response", format_response)
-    
-    # Set entry point
-    workflow.add_edge(START, "classify_request")
-    
-    # Compile with checkpointer
-    return workflow.compile(checkpointer=checkpointer)
-
-graph = build_hitl_graph()
-
-# --- 5. USER SIDE LOGIC ---
-
-def user_predict(message, history):
-    if not hasattr(user_predict, 'thread_id'):
-        user_predict.thread_id = f"session_{hashlib.md5(str(os.urandom(16)).encode()).hexdigest()[:8]}"
-    
-    thread_id = user_predict.thread_id
-    config = {"configurable": {"thread_id": thread_id}}
-    censored_user_message = censor_sensitive_data(message)
-    state = graph.get_state(config)
-    bot_response = ""
-    
-    # --- STATUS CHECK LOGIC ---
-    if message.lower().strip() in ["check", "status", "update", "done?"]:
-        if state.next and "human_review" in state.next:
-            bot_response = "⏳ **Still Waiting...** \n\nThe admin has not approved the request yet. Please wait a moment and type 'check' again."
-            history.append({"role": "user", "content": censored_user_message})
-            history.append({"role": "assistant", "content": bot_response})
-            return history, ""
-        
-        # Check if completed
-        messages = state.values.get("messages", [])
-        if messages:
-            last_msg = messages[-1]
-            if isinstance(last_msg, AIMessage):
-                clean_content = re.sub(r'<thinking>.*?</thinking>', '', last_msg.content, flags=re.DOTALL).strip()
-                bot_response = censor_sensitive_data(clean_content)
-                history.append({"role": "user", "content": censored_user_message})
-                history.append({"role": "assistant", "content": bot_response})
-                return history, ""
-        
-        bot_response = "No updates yet."
-        history.append({"role": "user", "content": censored_user_message})
-        history.append({"role": "assistant", "content": bot_response})
-        return history, ""
-    
-    # --- NORMAL CHAT LOGIC ---
-    if state.next and "human_review" in state.next:
-        bot_response = "⚠️ **Blocked**: You have a pending request waiting for approval. Type 'check' to see if it's been processed."
-        history.append({"role": "user", "content": censored_user_message})
-        history.append({"role": "assistant", "content": bot_response})
-        return history, ""
-
-    input_state = {
-        "messages": [HumanMessage(content=message)],
-        "thread_id": thread_id
-    }
-    
-    try:
-        result = graph.invoke(input_state, config=config)
-        updated_state = graph.get_state(config)
-        
-        if updated_state.next and "human_review" in updated_state.next:
-            bot_response = (f"✋ **Approval Needed**\n\n"
-                           f"Your credentials have been submitted for review.\n"
-                           f"Our admin will review your request, You can check your progress by typing **'check'**")
-        
-        elif result and "messages" in result:
-            last_msg = result["messages"][-1]
-            if isinstance(last_msg, AIMessage):
-                clean_content = re.sub(r'<thinking>.*?</thinking>', '', last_msg.content, flags=re.DOTALL).strip()
-                bot_response = censor_sensitive_data(clean_content)
-            
-    except Exception as e:
-        bot_response = f"❌ Error: {str(e)}"
-    
-    history.append({"role": "user", "content": censored_user_message})
-    history.append({"role": "assistant", "content": bot_response})
-    return history, ""
-
-# --- 6. ADMIN LOGIC (WITH DROPDOWN) ---
-
-def refresh_admin_view():
-    """Returns updated text for the dashboard AND updated choices for the dropdown."""
-    if not PENDING_APPROVALS:
-        # Return status text and an empty list of choices
-        return "No pending requests.", gr.update(choices=[], value=None)
-    
-    # Build text display
-    display_text = ""
-    # Build dropdown choices list (Thread IDs)
-    thread_choices = []
-    
-    for tid, data in PENDING_APPROVALS.items():
-        creds = data['credentials']
-        thread_choices.append(tid)
-        display_text += (
-            f"🔹 **Thread ID:** `{tid}`\n"
-            f"   **Username:** {creds.get('username', 'N/A')}\n"
-            f"   **Email:** {creds.get('email', 'N/A')}\n"
-            f"   **Zip Code:** {creds.get('zip_code', 'N/A')}\n"
-            f"   **Status:** {data['status']}\n\n"
-        )
-    
-    # Update dropdown with new choices and auto-select the first one
-    return display_text, gr.update(choices=thread_choices, value=thread_choices[0] if thread_choices else None)
-
-def admin_approve(target_tid, decision):
-    if not target_tid or target_tid not in PENDING_APPROVALS:
-        return f"❌ Error: ID '{target_tid}' not found or invalid."
-    
-    config = {"configurable": {"thread_id": target_tid}}
-    approval_status = "approved" if decision == "Approve" else "rejected"
-    
-    try:
-        # Resume graph
-        resume_command = Command(resume=approval_status)
-        graph.invoke(resume_command, config=config)
-        
-        del PENDING_APPROVALS[target_tid]
-        
-        return f"✅ Request {decision}d for Thread {target_tid}.\nThe user can now type 'check' to see the result."
-    except Exception as e:
-        return f"❌ Error processing decision: {str(e)}"
-
-# --- 7. UI LAYOUT ---
-
-with gr.Blocks(title="AI Agent System") as demo:
-    gr.Markdown("# 🤖 Corporate AI Assistant with LangGraph")
-    
-    with gr.Tabs():
-        # TAB 1: USER
-        with gr.TabItem("💬 Chat"):
-            chatbot = gr.Chatbot(label="Chat", height=500, value=[{"role": "assistant", "content": "Hello! I am the PenguinZ customer support chat bot. Ask me anything about company policies, orders, refunds, or any other information related."}]) 
-            msg = gr.Textbox(label="Type your message here...", placeholder="Ask me anything or say 'check' to see approval status")
-            clear = gr.Button("Clear Chat")
-            
-            gr.Examples(examples=["I need to verify my credentials", "What's the weather like?"], inputs=msg)
-            
-            def user_message_handler(message, history):
-                return user_predict(message, history)
-            
-            def clear_chat():
-                if hasattr(user_predict, 'thread_id'): delattr(user_predict, 'thread_id')
-                return [{"role": "assistant", "content": "Hello! I am the PenguinZ customer support chat bot. Ask me anything about company policies, orders, refunds, or any other information related."}], ""
-            
-            msg.submit(user_message_handler, [msg, chatbot], [chatbot, msg])
-            clear.click(clear_chat, None, [chatbot, msg])
-        
-        # TAB 2: ADMIN
-        with gr.TabItem("🔒 Admin Dashboard"):
-            gr.Markdown("### 🛡️ Security Approval Queue")
-            with gr.Row():
-                refresh_btn = gr.Button("🔄 Refresh List")
-                queue_display = gr.Markdown("No pending requests.")
-            gr.Markdown("---")
-            with gr.Row():
-                # NEW: Dropdown instead of Textbox
-                tid_dropdown = gr.Dropdown(label="Select Thread ID", choices=[], interactive=True)
-                decision_radio = gr.Radio(["Approve", "Reject"], label="Action", value="Approve")
-                process_btn = gr.Button("Submit Decision", variant="primary")
-            admin_output = gr.Markdown()
-
-            # Wiring Admin Events
-            # Clicking Refresh updates BOTH the text display AND the dropdown choices
-            refresh_btn.click(refresh_admin_view, outputs=[queue_display, tid_dropdown])
-            
-            # Clicking Process uses the selected value from the dropdown
-            process_btn.click(admin_approve, inputs=[tid_dropdown, decision_radio], outputs=admin_output)
-
-demo.launch()

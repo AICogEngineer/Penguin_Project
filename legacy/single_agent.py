@@ -10,6 +10,7 @@ import os
 import uuid
 import getpass
 from dotenv import load_dotenv
+from langchain_aws import ChatBedrockConverse
 
 SYSTEM_PROMPT = """ You are a customer support agent for the company, PenguinZ.
 
@@ -21,13 +22,15 @@ End all your sentences with -penguin, connecting -penguin to the last word with 
 Put the punctuation mark after the -penguin.
 """
 
+load_dotenv()
 
-model = ChatOllama(
-    model = "gpt-oss",
-    validate_model_on_init=True,
-    temperature=0.7
+model = ChatBedrockConverse(
+    model="us.amazon.nova-lite-v1:0",
+    temperature=0.7,
+    aws_access_key_id=os.getenv("BEDROCK_AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("BEDROCK_AWS_SECRET_ACCESS_KEY"),
+    region_name=os.getenv("BEDROCK_AWS_REGION", "us-east-1")
 )
-
 checkpointer = InMemorySaver()
 
 agent = create_agent(
